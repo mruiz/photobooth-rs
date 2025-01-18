@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package photobooth;
+
+import "google/protobuf/empty.proto";
+
+service PhotoBooth {
+  rpc ListCamera(google.protobuf.Empty) returns (ListCameraResponse) {}
+  rpc InitCamera(InitCameraRequest) returns (google.protobuf.Empty) {}
+  rpc StartPreview(google.protobuf.Empty) returns (google.protobuf.Empty) {}
+  rpc StopPreview(google.protobuf.Empty) returns (google.protobuf.Empty) {}
+  rpc TakePhoto(google.protobuf.Empty) returns (TakePhotoResponse) {}
+  rpc ConfigCaptureTarget(ConfigCaptureTargetRequest) returns (google.protobuf.Empty) {}
+  rpc ConfigAutoFocus(ConfigAutoFocusRequest) returns (google.protobuf.Empty) {}
+}
+
+message ListCameraResponse {
+  repeated string cameras = 1;
+}
+message InitCameraRequest {
+  string camera = 1;
+}
+message TakePhotoResponse {
+  bytes preview_image = 2;
+}
+message ConfigCaptureTargetRequest {
+  string config = 1;
+}
+message ConfigAutoFocusRequest {
+  string config = 1;
+}
