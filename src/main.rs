@@ -1,9 +1,28 @@
-use tokio::{sync::RwLock, time::timeout};
+use tokio::sync::RwLock;
+use tokio::task;
 use tonic::{transport::Server, Response, Status};
 use proto::photo_booth_server::{PhotoBooth, PhotoBoothServer};
 use gphoto2::{Camera, Context};
 use gphoto2::widget::{RadioWidget, ToggleWidget};
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
+use tokio::sync::Notify;
+use std::time::Duration;
+use std::path::Path;
+use gphoto2::camera::CameraEvent;
+use tokio::sync::Mutex;
+use axum::{
+    body:: {Body, Bytes},
+    Router,
+    routing::get,
+    response::{IntoResponse, Response as AxumResponse},
+    http::{
+        StatusCode,
+        header::CONTENT_TYPE
+    }
+};
+use tower::ServiceBuilder;
+use tokio::net::TcpListener;
+
 
 pub mod proto {
     tonic::include_proto!("photobooth");
@@ -13,10 +32,12 @@ pub mod proto {
 pub struct WrappedContext(Arc<Context>);
 pub struct WrappedCamera(Arc<tokio::sync::RwLock<Option<Camera>>>);
 
-#[derive(Default)]
 pub struct MyPhotobooth {
     context: WrappedContext,
-    camera: WrappedCamera
+    camera: WrappedCamera,
+    stop_preview_notify: Arc<Notify>,
+    shared_image: Arc<Mutex<Vec<u8>>>,
+    new_image_notify: Arc<Notify>,
 }
 
 impl Default for WrappedContext {
@@ -47,6 +68,38 @@ impl WrappedCamera {
     }
 }
 
+impl MyPhotobooth {
+    async fn shutdown_camera(&self) {
+        let mut camera_lock = self.camera.0.write().await;
+
+        if camera_lock.is_some() {
+            println!("🛑 Stop preview and close camera");
+            *camera_lock = None; // Drop de l'objet Camera → gp_camera_exit() implicite
+        }
+    }
+
+    pub async fn get_preview_image(&self) -> Option<Vec<u8>> {
+        let image = self.shared_image.lock().await;
+        if image.is_empty() {
+            None
+        } else {
+            Some(image.clone())
+        }
+    }
+}
+
+impl Default for MyPhotobooth {
+    fn default() -> Self {
+        Self {
+            context: WrappedContext::default(),
+            camera: WrappedCamera::default(),
+            stop_preview_notify: Arc::new(Notify::new()),
+            shared_image: Arc::new(Mutex::new(Vec::new())),
+            new_image_notify: Arc::new(Notify::new()),
+        }
+    }
+}
+
 #[tonic::async_trait]
 impl PhotoBooth for MyPhotobooth {
     async fn list_camera(&self, _request: tonic::Request<()>) -> Result<Response<proto::ListCameraResponse>, Status> {
@@ -66,59 +119,43 @@ impl PhotoBooth for MyPhotobooth {
     }
 
     async fn start_preview(&self, _request: tonic::Request<()>) -> Result<tonic::Response<()>, Status> {
-        Ok(Response::new(()))
-    }
+        let img_clone = Arc::clone(&self.shared_image);
+        let ctx_clone = self.context.inner().clone();
+        let notify = Arc::clone(&self.stop_preview_notify);
+        let new_image_notify = Arc::clone(&self.new_image_notify);
 
-    async fn stop_preview(&self, _request: tonic::Request<()>) -> Result<tonic::Response<()>, Status> {
-        Ok(Response::new(()))
-    }
+        if !self.camera.inner().await.is_some() {
+            let camera = self.context.inner().autodetect_camera().await.map_err(|e| Status::internal(e.to_string()))?;
+            self.camera.set(camera).await;
+        }
 
-    async fn take_photo(&self, _request: tonic::Request<()>) -> Result<Response<proto::TakePhotoResponse>, Status> {
         match self.camera.inner().await {
             Some(camera) => {
-                match timeout(Duration::from_secs(10), camera.capture_image()).await {
-                    Ok(result) => match result {
-                        Ok(file) => {
-                            println!("Photo path: {}", file.name());
-                            let response = proto::TakePhotoResponse {preview_image: vec![1, 2, 3, 4, 5]};
-                            Ok(Response::new(response))
-                        },
-                        Err(e) => {
-                            return Err(Status::internal(e.to_string()));
+                task::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            _ = notify.notified() => {
+                                println!("🛑 Stop streaming preview");
+                                break;
+                            },
+                            result = camera.capture_preview() => {
+                                match result {
+                                    Ok(preview_file) => match preview_file.get_data(&ctx_clone).await {
+                                        Ok(data) => {
+                                            let mut img = img_clone.lock().await;
+                                            *img = data.into_vec();
+                                            new_image_notify.notify_waiters();
+                                        }
+                                        Err(e) => eprintln!("Error capture_preview: {}", e),
+                                    }
+                                    Err(e) => eprintln!("❌ Error capture_preview: {}", e),
+                                    
+                                }
+                                std::thread::sleep(Duration::from_millis(33)); // ~30 fps
+                            }
                         }
                     }
-                    Err(_) => Err(Status::internal("Timeout"))
-                    
-                }
-            },
-            None => {
-                return Err(Status::failed_precondition("Camera not initialized"));
-            }
-        }
-    }
-
-    async fn init_camera(&self, request: tonic::Request<proto::InitCameraRequest>) -> Result<tonic::Response<()>, Status> {
-        let mut camera_stream = self.context.inner().list_cameras()
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-
-        let camera_name = request.into_inner().camera;
-        let camera_desc = camera_stream.find(|desc| desc.model == camera_name)
-            .ok_or_else(|| Status::not_found(format!("Could not find camera with name '{}'", camera_name)))?;
-        let camera = self.context.inner().get_camera(&camera_desc)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
-        
-        self.camera.set(camera).await;
-        Ok(Response::new(()))
-    }
-
-    async fn config_capture_target(&self, _request: tonic::Request<proto::ConfigCaptureTargetRequest>) -> Result<tonic::Response<()>, Status> {
-        match self.camera.inner().await {
-            Some(camera) => {
-                let capture_target = camera.config_key::<RadioWidget>("capturetarget").await.map_err(|e| Status::internal(format!("Failed to get capture target: {}", e)))?;
-                capture_target.set_choice("Internal RAM").map_err(|e| Status::internal(format!("Failed to set capture target: {}", e)))?;
-                camera.set_config(&capture_target).await.map_err(|e| Status::internal(format!("Failed to set config capture target: {}", e)))?; 
+                });
                 Ok(Response::new(()))
             },
             None => {
@@ -127,12 +164,93 @@ impl PhotoBooth for MyPhotobooth {
         }
     }
 
-    async fn config_auto_focus(&self, _request: tonic::Request<proto::ConfigAutoFocusRequest>) -> Result<tonic::Response<()>, Status> {
+    
+    async fn stop_preview(&self, _request: tonic::Request<()>) -> Result<tonic::Response<()>, Status> {
+        self.stop_preview_notify.notify_one();
+        self.shutdown_camera().await;
+        Ok(Response::new(()))
+    }
+
+    async fn capture_image(&self, _request: tonic::Request<proto::CaptureImageRequest>) -> Result<tonic::Response<()>, Status> {
+        if !self.camera.inner().await.is_some() {
+            let camera = self.context.inner().autodetect_camera().await.map_err(|e| Status::internal(e.to_string()))?;
+            self.camera.set(camera).await;
+        }
+
+        let path = &_request.get_ref().path;
         match self.camera.inner().await {
             Some(camera) => {
-                let cancel_autofocus = camera.config_key::<ToggleWidget>("cancelautofocus").await.map_err(|e| Status::internal(format!("Failed to get cancelautofocus: {}", e)))?;
-                cancel_autofocus.set_toggled(false);
-                camera.set_config(&cancel_autofocus).await.map_err(|e| Status::internal(format!("Failed to set config cancelautofocus target: {}", e)))?; 
+                let radio_widget = camera.config_key::<RadioWidget>("eosremoterelease").await.map_err(|e| Status::internal(e.to_string()))?;
+                radio_widget.set_choice("Immediate").map_err(|e| Status::internal(e.to_string()))?;
+                camera.set_config(&radio_widget).await.map_err(|e| Status::internal(e.to_string()))?; 
+                radio_widget.set_choice("Release Full").map_err(|e| Status::internal(e.to_string()))?;
+                camera.set_config(&radio_widget).await.map_err(|e| Status::internal(e.to_string()))?; 
+                
+                let mut retry = 0;
+
+                loop {
+                    let event = camera.wait_event(Duration::from_secs(10)).await.map_err(|e| Status::internal(e.to_string()))?;
+                    if let CameraEvent::NewFile(file) = event {
+                        println!("New file: {}/{}", file.folder(), file.name());
+                        let fs = camera.fs();
+                        fs.download_to(&file.folder(), &file.name(), Path::new(path)).await.map_err(|e| Status::internal(e.to_string()))?;                  
+                        println!("File:saved {}", path);
+                        break;
+                    }
+
+                    if let CameraEvent::Timeout = event {
+                        return Err(Status::failed_precondition("Timeout No new file added"));
+                    }
+
+                    retry += 1;
+
+                    if retry > 1000 {
+                        return Err(Status::failed_precondition("No new file added"));
+                    }
+                }
+                
+                Ok(Response::new(()))
+            },
+            None => {
+                return Err(Status::failed_precondition("Camera not initialized"));
+            }
+        }
+    }
+
+    async fn config_radio_widget(&self, _request: tonic::Request<proto::ConfigRadioWidgetRequest>) -> Result<tonic::Response<()>, Status> {
+        if !self.camera.inner().await.is_some() {
+            let camera = self.context.inner().autodetect_camera().await.map_err(|e| Status::internal(e.to_string()))?;
+            self.camera.set(camera).await;
+        }
+
+        let name = &_request.get_ref().name;
+        let value = &_request.get_ref().value;
+        match self.camera.inner().await {
+            Some(camera) => {
+                let radio_widget = camera.config_key::<RadioWidget>(&name).await.map_err(|e| Status::internal(format!("Failed to get {}: {}", name, e)))?;
+                radio_widget.set_choice(&value).map_err(|e| Status::internal(format!("Failed to set {}: {}",name, e)))?;
+                camera.set_config(&radio_widget).await.map_err(|e| Status::internal(format!("Failed to set config {} target: {}", name, e)))?; 
+                Ok(Response::new(()))
+            },
+            None => {
+                return Err(Status::failed_precondition("Camera not initialized"));
+            }
+        }
+    }
+
+    async fn config_toggle_widget(&self, _request: tonic::Request<proto::ConfigToggleWidgetRequest>) -> Result<tonic::Response<()>, Status> {
+        if !self.camera.inner().await.is_some() {
+            let camera = self.context.inner().autodetect_camera().await.map_err(|e| Status::internal(e.to_string()))?;
+            self.camera.set(camera).await;
+        }
+
+        let name = &_request.get_ref().name;
+        let value = &_request.get_ref().value;
+        match self.camera.inner().await {
+            Some(camera) => {
+                let toggle_widget = camera.config_key::<ToggleWidget>(&name).await.map_err(|e| Status::internal(format!("Failed to get key: {}", e)))?;
+                toggle_widget.set_toggled(*value);
+                camera.set_config(&toggle_widget).await.map_err(|e| Status::internal(format!("Failed to set config target: {}", e)))?; 
                 Ok(Response::new(()))
             },
             None => {
@@ -142,19 +260,137 @@ impl PhotoBooth for MyPhotobooth {
     }
 }
 
+#[tonic::async_trait]
+impl PhotoBooth for Arc<MyPhotobooth> {
+    async fn list_camera(&self, req: tonic::Request<()>) -> Result<tonic::Response<proto::ListCameraResponse>, tonic::Status> {
+        self.as_ref().list_camera(req).await
+    }
+
+    async fn start_preview(&self, req: tonic::Request<()>) -> Result<tonic::Response<()>, tonic::Status> {
+        self.as_ref().start_preview(req).await
+    }
+
+    async fn stop_preview(&self, req: tonic::Request<()>) -> Result<tonic::Response<()>, tonic::Status> {
+        self.as_ref().stop_preview(req).await
+    }
+
+    async fn capture_image(&self, req: tonic::Request<proto::CaptureImageRequest>) -> Result<tonic::Response<()>, tonic::Status> {
+        self.as_ref().capture_image(req).await
+    }
+
+    async fn config_radio_widget(&self, req: tonic::Request<proto::ConfigRadioWidgetRequest>) -> Result<tonic::Response<()>, tonic::Status> {
+        self.as_ref().config_radio_widget(req).await
+    }
+
+    async fn config_toggle_widget(&self, req: tonic::Request<proto::ConfigToggleWidgetRequest>) -> Result<tonic::Response<()>, tonic::Status> {
+        self.as_ref().config_toggle_widget(req).await
+    }
+}
+
+async fn mjpeg_preview_handler(
+    photobooth: Arc<MyPhotobooth>,
+) -> impl IntoResponse {
+    // Boundary for MJPEG stream
+    let boundary = "frame";
+
+    let notify = Arc::clone(&photobooth.new_image_notify);
+    // Créer le flux MJPEG
+    let stream = async_stream::stream! {
+        loop {
+            let image_data = match photobooth.get_preview_image().await {
+                Some(data) => data,
+                None => {
+                    notify.notified().await;
+                    continue;
+                }
+            };
+
+            let part = format!(
+                "--{}\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+                boundary,
+                image_data.len()
+            )
+            .into_bytes();
+
+            yield Ok::<_, std::io::Error>(Bytes::from(part));
+            yield Ok::<_, std::io::Error>(Bytes::from(image_data));
+            yield Ok::<_, std::io::Error>(Bytes::from(b"\r\n".to_vec()));
+
+            tokio::time::sleep(Duration::from_millis(33)).await;
+        }
+    };
+
+    // Créer le body en utilisant axum::body::Body
+    let body = Body::from_stream(stream);
+
+    // Construction de la réponse avec le bon Content-Type pour MJPEG
+    AxumResponse::builder()
+        .status(StatusCode::OK)
+        .header(
+            CONTENT_TYPE,
+            format!("multipart/x-mixed-replace; boundary={}", boundary),
+        )
+        .body(body)
+        .unwrap()
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let addr = "[::1]:50051".parse().unwrap();
-    let photobooth = MyPhotobooth::default();
+    // let addr = "[::1]:50051".parse().unwrap();
+    let grpc_addr = "[::]:50051".parse()?;
+    let photobooth = Arc::new(MyPhotobooth::default());
+    
 
-    let service = tonic_reflection::server::Builder::configure()
-        .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
-        .build_v1()?;
+    let http_server = {
+        let app = Router::new()
+            .route("/preview", get({
+                let photobooth = Arc::clone(&photobooth);
+                move || mjpeg_preview_handler(photobooth)
+            }))
+            .layer(ServiceBuilder::new());
 
-    Server::builder()
-        .add_service(service)
-        .add_service(PhotoBoothServer::new(photobooth))
-        .serve(addr)
-        .await?;
+        let listener = TcpListener::bind("0.0.0.0:8080").await?;
+        println!("🌐 HTTP server listening on http://{}", listener.local_addr()?);
+        axum::serve(listener, app)
+    };
+
+    // let photobooth_sig = Arc::clone(&photobooth);
+    // tokio::spawn(async move {
+        
+    //     let mut sigterm = signal(SignalKind::terminate()).unwrap();
+        
+    //     tokio::select! {
+    //         _ = sigterm.recv() => {
+    //             // Exécuter le nettoyage de la caméra
+    //             println!("Received SIGTERM, shutting down...");
+    //             photobooth_sig.shutdown_camera().await;
+    //         }
+    //     }
+    // });
+
+    let grpc_server = {
+        let service = tonic_reflection::server::Builder::configure()
+            .register_encoded_file_descriptor_set(proto::FILE_DESCRIPTOR_SET)
+            .build_v1()?;
+        Server::builder()
+            .add_service(service)
+            .add_service(PhotoBoothServer::new(Arc::clone(&photobooth)))
+            .serve(grpc_addr)
+    };
+
+
+    tokio::select! {
+        res = grpc_server => {
+            if let Err(e) = res {
+                eprintln!("gRPC server error: {}", e);
+            }
+        }
+        res = http_server => {
+            if let Err(e) = res {
+                eprintln!("HTTP server error: {}", e);
+            }
+        }
+    }
+
     Ok(())
 }

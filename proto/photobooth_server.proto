@@ -6,26 +6,28 @@ import "google/protobuf/empty.proto";
 
 service PhotoBooth {
   rpc ListCamera(google.protobuf.Empty) returns (ListCameraResponse) {}
-  rpc InitCamera(InitCameraRequest) returns (google.protobuf.Empty) {}
   rpc StartPreview(google.protobuf.Empty) returns (google.protobuf.Empty) {}
   rpc StopPreview(google.protobuf.Empty) returns (google.protobuf.Empty) {}
-  rpc TakePhoto(google.protobuf.Empty) returns (TakePhotoResponse) {}
-  rpc ConfigCaptureTarget(ConfigCaptureTargetRequest) returns (google.protobuf.Empty) {}
-  rpc ConfigAutoFocus(ConfigAutoFocusRequest) returns (google.protobuf.Empty) {}
+  rpc CaptureImage(CaptureImageRequest) returns (google.protobuf.Empty) {}
+  rpc ConfigRadioWidget(ConfigRadioWidgetRequest) returns (google.protobuf.Empty) {}
+  rpc ConfigToggleWidget(ConfigToggleWidgetRequest) returns (google.protobuf.Empty) {}
 }
 
 message ListCameraResponse {
   repeated string cameras = 1;
 }
-message InitCameraRequest {
-  string camera = 1;
+
+message CaptureImageRequest {
+  string path = 1;
 }
-message TakePhotoResponse {
-  bytes preview_image = 2;
+
+message ConfigRadioWidgetRequest {
+  string name = 1;
+  string value = 2;
 }
-message ConfigCaptureTargetRequest {
-  string config = 1;
+
+message ConfigToggleWidgetRequest {
+  string name = 1;
+  bool value = 2;
 }
-message ConfigAutoFocusRequest {
-  string config = 1;
-}
+

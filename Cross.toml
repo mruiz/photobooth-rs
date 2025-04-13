@@ -1,0 +1,13 @@
+# Cross.toml
+
+#
+# Linux
+#
+# Install specific dependencies required to build application
+
+
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+	"dpkg --add-architecture arm64",
+        "apt-get update && apt-get install --assume-yes protobuf-compiler libgphoto2-dev:arm64"
+]
