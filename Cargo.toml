@@ -13,6 +13,7 @@ futures = "0.3"
 axum = "0.8.3"
 tower = "0.5.2"
 async-stream = "0.3.6"
+gpiod = "0.3.0"
 
 [build-dependencies]
 tonic-build = "0.12.3"

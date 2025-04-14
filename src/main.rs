@@ -7,7 +7,6 @@ use gphoto2::widget::{RadioWidget, ToggleWidget};
 use std::sync::Arc;
 use tokio::sync::Notify;
 use std::time::Duration;
-use std::path::Path;
 use gphoto2::camera::CameraEvent;
 use tokio::sync::Mutex;
 use axum::{
@@ -22,6 +21,7 @@ use axum::{
 };
 use tower::ServiceBuilder;
 use tokio::net::TcpListener;
+use gpiod::{Chip, Options};
 
 
 pub mod proto {
@@ -36,8 +36,10 @@ pub struct MyPhotobooth {
     context: WrappedContext,
     camera: WrappedCamera,
     stop_preview_notify: Arc<Notify>,
-    shared_image: Arc<Mutex<Vec<u8>>>,
+    shared_preview: Arc<Mutex<Vec<u8>>>,
     new_image_notify: Arc<Notify>,
+    shared_image: Arc<Mutex<Vec<u8>>>,
+    previewing: Arc<Mutex<bool>>,
 }
 
 impl Default for WrappedContext {
@@ -79,12 +81,31 @@ impl MyPhotobooth {
     }
 
     pub async fn get_preview_image(&self) -> Option<Vec<u8>> {
+        let image = self.shared_preview.lock().await;
+        if image.is_empty() {
+            None
+        } else {
+            Some(image.clone())
+        }
+    }
+
+    pub async fn get_capture_image(&self) -> Option<Vec<u8>> {
         let image = self.shared_image.lock().await;
         if image.is_empty() {
             None
         } else {
             Some(image.clone())
         }
+    }
+
+    pub async fn get_status_previewing(&self) -> bool {
+        let status = self.previewing.lock().await;
+        status.clone()
+    }
+
+    pub async fn set_status_previewing(&self, status: bool) {
+        let mut previewing = self.previewing.lock().await;
+        *previewing = status;
     }
 }
 
@@ -94,8 +115,10 @@ impl Default for MyPhotobooth {
             context: WrappedContext::default(),
             camera: WrappedCamera::default(),
             stop_preview_notify: Arc::new(Notify::new()),
-            shared_image: Arc::new(Mutex::new(Vec::new())),
+            shared_preview: Arc::new(Mutex::new(Vec::new())),
             new_image_notify: Arc::new(Notify::new()),
+            shared_image: Arc::new(Mutex::new(Vec::new())),
+            previewing: Arc::new(Mutex::new(false)),
         }
     }
 }
@@ -119,10 +142,12 @@ impl PhotoBooth for MyPhotobooth {
     }
 
     async fn start_preview(&self, _request: tonic::Request<()>) -> Result<tonic::Response<()>, Status> {
-        let img_clone = Arc::clone(&self.shared_image);
+        let img_clone = Arc::clone(&self.shared_preview);
         let ctx_clone = self.context.inner().clone();
         let notify = Arc::clone(&self.stop_preview_notify);
         let new_image_notify = Arc::clone(&self.new_image_notify);
+        self.set_status_previewing(true).await;
+        let previewing_clone = Arc::clone(&self.previewing);
 
         if !self.camera.inner().await.is_some() {
             let camera = self.context.inner().autodetect_camera().await.map_err(|e| Status::internal(e.to_string()))?;
@@ -136,6 +161,8 @@ impl PhotoBooth for MyPhotobooth {
                         tokio::select! {
                             _ = notify.notified() => {
                                 println!("🛑 Stop streaming preview");
+                                let mut previewing = previewing_clone.lock().await;
+                                *previewing = false; 
                                 break;
                             },
                             result = camera.capture_preview() => {
@@ -166,18 +193,21 @@ impl PhotoBooth for MyPhotobooth {
 
     
     async fn stop_preview(&self, _request: tonic::Request<()>) -> Result<tonic::Response<()>, Status> {
-        self.stop_preview_notify.notify_one();
-        self.shutdown_camera().await;
+        if self.get_status_previewing().await == true {
+            self.stop_preview_notify.notify_one();
+            self.shutdown_camera().await;
+        }
+        
         Ok(Response::new(()))
     }
 
-    async fn capture_image(&self, _request: tonic::Request<proto::CaptureImageRequest>) -> Result<tonic::Response<()>, Status> {
+    async fn capture_image(&self, _request: tonic::Request<()>) -> Result<tonic::Response<()>, Status> {
         if !self.camera.inner().await.is_some() {
             let camera = self.context.inner().autodetect_camera().await.map_err(|e| Status::internal(e.to_string()))?;
             self.camera.set(camera).await;
         }
 
-        let path = &_request.get_ref().path;
+        let img_clone = Arc::clone(&self.shared_image);
         match self.camera.inner().await {
             Some(camera) => {
                 let radio_widget = camera.config_key::<RadioWidget>("eosremoterelease").await.map_err(|e| Status::internal(e.to_string()))?;
@@ -191,10 +221,13 @@ impl PhotoBooth for MyPhotobooth {
                 loop {
                     let event = camera.wait_event(Duration::from_secs(10)).await.map_err(|e| Status::internal(e.to_string()))?;
                     if let CameraEvent::NewFile(file) = event {
-                        println!("New file: {}/{}", file.folder(), file.name());
                         let fs = camera.fs();
-                        fs.download_to(&file.folder(), &file.name(), Path::new(path)).await.map_err(|e| Status::internal(e.to_string()))?;                  
-                        println!("File:saved {}", path);
+                        let camera_file = fs.download(&file.folder(), &file.name()).await.map_err(|e| Status::internal(e.to_string()))?;
+                        let data = camera_file.get_data(self.context.inner()).await.map_err(|e| Status::internal(e.to_string()))?;
+                        let mut img = img_clone.lock().await;
+                        *img = data.into_vec();
+                        fs.delete_file(&file.folder(), &file.name());
+                        println!("New file: {}/{}", file.folder(), file.name());
                         break;
                     }
 
@@ -258,6 +291,22 @@ impl PhotoBooth for MyPhotobooth {
             }
         }
     }
+    
+    async fn set_gpio(&self, _request: tonic::Request<proto::SetGpioRequest>) -> Result<tonic::Response<()>, Status> {
+        let request_inner = _request.into_inner(); 
+        let chip_req = request_inner.chip;
+        let value_req = request_inner.value;
+        let line_req = request_inner.line;
+
+        let chip = Chip::new(chip_req).map_err(|e| Status::internal(format!("Failed to get key: {}", e)))?;
+        let opts = Options::output([line_req])
+            .values([false])
+            .consumer("photobooth");
+        let lines = chip.request_lines(opts).map_err(|e| Status::internal(format!("Failed to get key: {}", e)))?;
+
+        lines.set_values(&[value_req]).map_err(|e| Status::internal(format!("Failed to get key: {}", e)))?;
+        Ok(Response::new(()))
+    }
 }
 
 #[tonic::async_trait]
@@ -274,7 +323,7 @@ impl PhotoBooth for Arc<MyPhotobooth> {
         self.as_ref().stop_preview(req).await
     }
 
-    async fn capture_image(&self, req: tonic::Request<proto::CaptureImageRequest>) -> Result<tonic::Response<()>, tonic::Status> {
+    async fn capture_image(&self, req: tonic::Request<()>) -> Result<tonic::Response<()>, tonic::Status> {
         self.as_ref().capture_image(req).await
     }
 
@@ -284,6 +333,10 @@ impl PhotoBooth for Arc<MyPhotobooth> {
 
     async fn config_toggle_widget(&self, req: tonic::Request<proto::ConfigToggleWidgetRequest>) -> Result<tonic::Response<()>, tonic::Status> {
         self.as_ref().config_toggle_widget(req).await
+    }
+
+    async fn set_gpio(&self, req: tonic::Request<proto::SetGpioRequest>) -> Result<tonic::Response<()>, Status> {
+        self.as_ref().set_gpio(req).await
     }
 }
 
@@ -334,6 +387,20 @@ async fn mjpeg_preview_handler(
         .unwrap()
 }
 
+async fn image_handler(photobooth: Arc<MyPhotobooth>) -> AxumResponse {
+    match photobooth.get_capture_image().await {
+        Some(image_data) => (
+            StatusCode::OK,
+            [(CONTENT_TYPE, "image/jpeg")],
+            image_data,
+        ).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            "No preview image available".to_string(),
+        ).into_response()
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // let addr = "[::1]:50051".parse().unwrap();
@@ -343,6 +410,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let http_server = {
         let app = Router::new()
+            .route("/image", get({
+                let photobooth = Arc::clone(&photobooth);
+                move || image_handler(photobooth)
+            }))
             .route("/preview", get({
                 let photobooth = Arc::clone(&photobooth);
                 move || mjpeg_preview_handler(photobooth)
