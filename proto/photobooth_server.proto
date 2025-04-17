@@ -12,6 +12,7 @@ service PhotoBooth {
   rpc ConfigRadioWidget(ConfigRadioWidgetRequest) returns (google.protobuf.Empty) {}
   rpc ConfigToggleWidget(ConfigToggleWidgetRequest) returns (google.protobuf.Empty) {}
   rpc SetGpio(SetGpioRequest) returns (google.protobuf.Empty) {}
+  rpc Shutdown(google.protobuf.Empty) returns (google.protobuf.Empty) {}
 }
 
 message ListCameraResponse {

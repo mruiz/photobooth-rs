@@ -22,6 +22,7 @@ use axum::{
 use tower::ServiceBuilder;
 use tokio::net::TcpListener;
 use gpiod::{Chip, Options};
+use std::process::Command;
 
 
 pub mod proto {
@@ -307,6 +308,14 @@ impl PhotoBooth for MyPhotobooth {
         lines.set_values(&[value_req]).map_err(|e| Status::internal(format!("Failed to get key: {}", e)))?;
         Ok(Response::new(()))
     }
+
+    async fn shutdown(&self, _request: tonic::Request<()>) -> Result<tonic::Response<()>, Status> {
+        let _ = Command::new("sudo")
+            .arg("systemctl")
+            .arg("poweroff")
+            .status();
+        Ok(Response::new(()))
+    }
 }
 
 #[tonic::async_trait]
@@ -337,6 +346,9 @@ impl PhotoBooth for Arc<MyPhotobooth> {
 
     async fn set_gpio(&self, req: tonic::Request<proto::SetGpioRequest>) -> Result<tonic::Response<()>, Status> {
         self.as_ref().set_gpio(req).await
+    }
+    async fn shutdown(&self, req: tonic::Request<()>) -> Result<tonic::Response<()>, Status> { 
+        self.as_ref().shutdown(req).await
     }
 }
 
